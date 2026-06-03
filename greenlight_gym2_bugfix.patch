@@ -1,9 +1,9 @@
 From e9ff07cc451f85eb962115005359866022d4993c Mon Sep 17 00:00:00 2001
 From: Claude <noreply@anthropic.com>
 Date: Wed, 3 Jun 2026 03:04:15 +0000
-Subject: [PATCH] =?UTF-8?q?fix:=20=EC=BD=94=EB=93=9C=20=EB=A6=AC=EB=B7=B0?=
- =?UTF-8?q?=EC=97=90=EC=84=9C=20=EB=B0=9C=EA=B2=AC=EB=90=9C=20=EB=B2=84?=
- =?UTF-8?q?=EA=B7=B8=205=EA=B1=B4=20=EC=88=98=EC=A0=95?=
+Subject: [PATCH 1/2] =?UTF-8?q?fix:=20=EC=BD=94=EB=93=9C=20=EB=A6=AC?=
+ =?UTF-8?q?=EB=B7=B0=EC=97=90=EC=84=9C=20=EB=B0=9C=EA=B2=AC=EB=90=9C=20?=
+ =?UTF-8?q?=EB=B2=84=EA=B7=B8=205=EA=B1=B4=20=EC=88=98=EC=A0=95?=
 MIME-Version: 1.0
 Content-Type: text/plain; charset=UTF-8
 Content-Transfer-Encoding: 8bit
@@ -268,6 +268,158 @@ index af41c47..2a1d7b0 100644
 +if __name__ == "__main__":
      unittest.main()
 -    
+-- 
+2.43.0
+
+
+From cd0e048e688046c52e65cf8fb5ada5a9930dae61 Mon Sep 17 00:00:00 2001
+From: Claude <noreply@anthropic.com>
+Date: Wed, 3 Jun 2026 03:10:38 +0000
+Subject: [PATCH 2/2] =?UTF-8?q?refactor:=20=EB=82=98=EB=A8=B8=EC=A7=80=20?=
+ =?UTF-8?q?=ED=92=88=EC=A7=88=20=EC=9D=B4=EC=8A=88=203=EA=B1=B4=20?=
+ =?UTF-8?q?=EC=88=98=EC=A0=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Q-3 (weather.py): WeatherRepository 캐시 키에 season_length, pred_horizon, dt, nd 추가
+- 동일 시나리오라도 다른 env 설정에서 잘못된 캐시 반환 방지
+
+Q-4 (rewards.py): GreenhouseReward.__init__의 더미 RewardContext 제거
+- 11개 필드 중 2개(p, dt)만 사용하던 RewardContext를 _BoundCtx 경량 dataclass로 교체
+- max_profit_reward / min_profit_reward 호출에만 사용되는 최소 컨텍스트
+
+Q-5 (rewards.py): 파라미터 벡터 magic index를 명명 상수로 교체
+- _P_FLOOR_AREA=46, _P_MAX_HEATING=108, _P_MAX_CO2=109
+- _P_MAX_FRUIT_GROWTH=154, _P_LAMP_POWER=172
+- _variable_costs, max_profit_reward, min_profit_reward 전체 적용
+
+https://claude.ai/code/session_01DrnX2MjcNVbwjPrtSvjRng
+---
+ gl_gym/components/rewards.py | 58 +++++++++++++++++++-----------------
+ gl_gym/components/weather.py |  2 +-
+ 2 files changed, 32 insertions(+), 28 deletions(-)
+
+diff --git a/gl_gym/components/rewards.py b/gl_gym/components/rewards.py
+index eaa575f..d7cc479 100644
+--- a/gl_gym/components/rewards.py
++++ b/gl_gym/components/rewards.py
+@@ -1,9 +1,27 @@
+ from abc import ABC, abstractmethod
++from dataclasses import dataclass, field
+ from typing import SupportsFloat, Dict
+ import numpy as np
+ from gl_gym.core.types import RewardContext
+ from gl_gym.components.price_model import FixedPrice
+ 
++# Named indices into the GreenLight parameter vector (208 entries).
++# Source: gl_gym/configs/greenlight_parameters.py (TOMATO_PARAMETER_DEFS)
++_P_FLOOR_AREA = 46         # aFlr  [m^2]
++_P_MAX_HEATING = 108       # phiPipeMax  [W]
++_P_MAX_CO2 = 109           # phiExtCo2Max  [mg/s]
++_P_MAX_FRUIT_GROWTH = 154  # rgFruit  [mg CH2O / m^2 / s]
++_P_LAMP_POWER = 172        # thetaLampMax  [W/m^2]
++
++
++@dataclass
++class _BoundCtx:
++    """Minimal context for price-model calls during normalization bound computation."""
++    p: np.ndarray
++    dt: float
++    day_of_year: float = 0.0
++    hour_of_day: float = 0.0
++
+ class BaseReward(ABC):
+     @abstractmethod
+     def compute_reward(self, ctx: RewardContext) -> tuple[SupportsFloat, Dict[str, float]]:
+@@ -42,21 +60,6 @@ class GreenhouseReward(BaseReward):
+                 ) -> None:
+         super(GreenhouseReward, self).__init__()
+ 
+-
+-        ctx = RewardContext(
+-            t=0,
+-            dt=dt,
+-            Np=0,
+-            x_prev=np.zeros(26),
+-            x=np.zeros(26),
+-            u=np.zeros(6),
+-            p=p,
+-            d=np.zeros(10),
+-            obs={},
+-            day_of_year=0,
+-            hour_of_day=0,
+-        )
+-
+         # variable prices for the electricity, heating co2
+         self.elec_price_model = FixedPrice(elec_price)
+         self.heating_price_model = FixedPrice(heating_price)
+@@ -67,8 +70,11 @@ class GreenhouseReward(BaseReward):
+         self.pen_lamp = pen_lamp
+         self._init_costs()
+         self._init_violations()
+-        self.max_profit = self.max_profit_reward(ctx)
+-        self.min_profit = self.min_profit_reward(ctx)
++
++        # Lightweight context sufficient for price-model calls at init time
++        _ctx = _BoundCtx(p=p, dt=dt)
++        self.max_profit = self.max_profit_reward(_ctx)
++        self.min_profit = self.min_profit_reward(_ctx)
+         self.min_state_violations = self.min_violations()
+         self.max_state_violations = self.max_violations()
+ 
+@@ -90,7 +96,7 @@ class GreenhouseReward(BaseReward):
+         Returns:
+             float: The maximum possible reward.
+         """
+-        max_gains = ctx.p[154] * ctx.dt * 1e-6 /self.dmfm * self.fruit_price_model.get_price(ctx)
++        max_gains = ctx.p[_P_MAX_FRUIT_GROWTH] * ctx.dt * 1e-6 / self.dmfm * self.fruit_price_model.get_price(ctx)
+         return max_gains
+ 
+     def min_profit_reward(self, ctx: RewardContext) -> float:
+@@ -102,12 +108,10 @@ class GreenhouseReward(BaseReward):
+         Returns:
+             float: The minimum possible reward.
+         """
+-        max_heating = ctx.p[108] / ctx.p[46] * ctx.dt/3600*1e-3 * self.heating_price_model.get_price(ctx)     # convert W/aFlr to kWh/m2
+-        max_elec = ctx.p[172] * ctx.dt/3600*1e-3 * self.elec_price_model.get_price(ctx)                          # convert W/aFlr to kWh/m2
+-        max_cost = ctx.p[109] / ctx.p[46] * ctx.dt * 1e-6 * self.co2_price_model.get_price(ctx)        # convert to kg/m2
+-        max_costs = sum([max_heating, max_elec, max_cost])
+-        max_costs = -max_costs
+-        return max_costs
++        max_heating = ctx.p[_P_MAX_HEATING] / ctx.p[_P_FLOOR_AREA] * ctx.dt/3600*1e-3 * self.heating_price_model.get_price(ctx)  # W → kWh/m²
++        max_elec = ctx.p[_P_LAMP_POWER] * ctx.dt/3600*1e-3 * self.elec_price_model.get_price(ctx)                               # W/m² → kWh/m²
++        max_co2 = ctx.p[_P_MAX_CO2] / ctx.p[_P_FLOOR_AREA] * ctx.dt * 1e-6 * self.co2_price_model.get_price(ctx)               # mg/s → kg/m²
++        return -(max_heating + max_elec + max_co2)
+ 
+     def _init_violations(self):
+         self.temp_violation = 0
+@@ -131,9 +135,9 @@ class GreenhouseReward(BaseReward):
+         Returns:
+             float: The total variable costs.
+         """
+-        heating_energy = ctx.u[0] * ctx.p[108] / ctx.p[46] * ctx.dt/3600 * 1e-3   # convert W/aFlr to kWh/m2
+-        elec_use = ctx.u[4] * ctx.p[172] * ctx.dt/3600*1e-3                          # convert W/aFlr to kWh/m2
+-        co2_dosing = ctx.u[1] * ctx.p[109] / ctx.p[46] * ctx.dt * 1e-6          # convert to kg/m2
++        heating_energy = ctx.u[0] * ctx.p[_P_MAX_HEATING] / ctx.p[_P_FLOOR_AREA] * ctx.dt/3600 * 1e-3  # W → kWh/m²
++        elec_use = ctx.u[4] * ctx.p[_P_LAMP_POWER] * ctx.dt/3600*1e-3                                 # W/m² → kWh/m²
++        co2_dosing = ctx.u[1] * ctx.p[_P_MAX_CO2] / ctx.p[_P_FLOOR_AREA] * ctx.dt * 1e-6             # mg/s → kg/m²
+         self.heat_cost = heating_energy * self.heating_price_model.get_price(ctx)
+         self.co2_cost = co2_dosing * self.co2_price_model.get_price(ctx)
+         self.elec_cost = elec_use * self.elec_price_model.get_price(ctx)
+diff --git a/gl_gym/components/weather.py b/gl_gym/components/weather.py
+index 79be17c..03e4f86 100644
+--- a/gl_gym/components/weather.py
++++ b/gl_gym/components/weather.py
+@@ -28,7 +28,7 @@ class WeatherRepository:
+         dt: int,
+         nd: int,
+     ) -> np.ndarray:
+-        key = (location, growth_year, start_day)
++        key = (location, growth_year, start_day, season_length, pred_horizon, dt, nd)
+         if key not in self._cache:
+             arr = self.load_weather_data_fn(
+                 weather_data_dir=self.weather_data_dir,
 -- 
 2.43.0
 
